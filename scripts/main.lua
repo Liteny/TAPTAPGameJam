@@ -1,782 +1,738 @@
 -- ====================================================================
--- 《五四三二一：重力倒计时》— 关卡编辑器 + 核心玩法验证
+-- 《五四三二一：重力倒计时》— 关卡编辑器 v3
 -- ====================================================================
---
--- 技术方案:
---   渲染: NanoVG (矢量几何图形)
---   物理: 自定义 AABB 碰撞 (半步积分防穿透)
---   UI:   urhox-libs/UI (工具栏/HUD)
---   分辨率: 设计分辨率 640×360 (模式 A)
---
--- 模式:
---   EDIT  - 关卡编辑 (放置瓦片/开关/出生点/出口)
---   PLAY  - 试玩验证 (核心重力机制)
---
--- 物理验证:
---   跳跃初速度 = 560 px/s (含 2% 时间步进补偿)
---   max_height = v² / (2g)
---   等级5: 560²/(2×942)  = 166px > 5格(160px) ✓
---   等级4: 560²/(2×1177) = 133px > 4格(128px) ✓
---   等级3: 560²/(2×1570) = 100px > 3格(96px)  ✓
---   等级2: 560²/(2×2355) = 67px  > 2格(64px)  ✓
---   等级1: 560²/(2×4709) = 33px  > 1格(32px)  ✓
---
+-- 功能:
+--   网格画布 (缩放/WASD平移)、12种元素
+--   左键放置、右键清除
+--   撤销/重做 (Ctrl+Z/Y)、BFS物理验证
+--   JSON导出、文件保存/加载
 -- ====================================================================
 
 local UI = require("urhox-libs/UI")
+local Config = require("Editor.Config")
+local History = require("Editor.History")
+local Tools = require("Editor.Tools")
+local Validator = require("Editor.Validator")
+local Storage = require("Editor.Storage")
+local PlayMode = require("Editor.PlayMode")
 
 -- ====================================================================
--- 常量
+-- 全局状态
 -- ====================================================================
-
--- 设计分辨率
-local DESIGN_W = 640
-local DESIGN_H = 360
-
--- 瓦片
-local TILE = 32
-
--- 地图尺寸 (瓦片数)
-local MAP_W = 60
-local MAP_H = 22  -- 22格高 = 704px，提供充足的垂直编辑空间
-
--- 瓦片类型
-local T_EMPTY = 0
-local T_SOLID = 1   -- 实心平台
-
--- 重力开关: 10 + 等级
-local T_SW1 = 11    -- 超重
-local T_SW2 = 12    -- 重
-local T_SW3 = 13    -- 正常
-local T_SW4 = 14    -- 轻
-local T_SW5 = 15    -- 超轻
-
--- 特殊标记 (仅编辑器用，不存入 map)
-local T_SPAWN = 20
-local T_EXIT  = 21
-
--- 重力等级参数
--- 跳跃初速度含 2% 补偿，确保离散时间步下能越过 N 格平台
-local JUMP_SPEED = 560
-
-local GRAVITY_LEVELS = {
-    [5] = { name = "超轻", gravity = 942,  color = {0, 229, 255},   tiles = 5 },  -- 青
-    [4] = { name = "轻",   gravity = 1177, color = {0, 230, 118},   tiles = 4 },  -- 绿
-    [3] = { name = "正常", gravity = 1570, color = {255, 234, 0},   tiles = 3 },  -- 黄
-    [2] = { name = "重",   gravity = 2355, color = {255, 145, 0},   tiles = 2 },  -- 橙
-    [1] = { name = "超重", gravity = 4709, color = {255, 23, 68},   tiles = 1 },  -- 红
-}
-
--- 玩家参数 (正方形碰撞箱)
-local PLAYER_W = 24
-local PLAYER_H = 24
-local GROUND_SPEED = 200    -- px/s
-local AIR_SPEED = 150       -- px/s (75% 地面速度)
-local GROUND_ACCEL = 2000   -- px/s²
-local AIR_ACCEL = 1200      -- px/s² (空中加速稍低)
-local FRICTION = 12         -- 地面摩擦
-local COYOTE_TIME = 0.08    -- 土狼时间
-local JUMP_BUFFER = 0.12    -- 跳跃缓冲
-local MAX_FALL_SPEED = 800  -- 最大下落速度 (防穿透)
-
--- 颜色
-local C_BG       = {10, 14, 39}
-local C_PLATFORM = {26, 32, 64}
-local C_GRID     = {40, 50, 80, 80}
-local C_PLAYER   = {220, 230, 255}
-local C_EXIT     = {180, 255, 180}
-
--- ====================================================================
--- 游戏状态
--- ====================================================================
-
-local MODE_EDIT = 0
-local MODE_PLAY = 1
-
-local gameMode = MODE_EDIT
-
--- 地图数据: map[y][x] (1-indexed)
-local map = {}
-
--- 编辑器状态
-local editor = {
-    tool = T_SOLID,
-    cameraX = 0,
-    cameraY = 0,
-    spawnX = 3,
-    spawnY = 9,
-    exitX = MAP_W - 3,
-    exitY = 9,
-}
-
--- 玩家状态
-local player = {
-    x = 0, y = 0,
-    vx = 0, vy = 0,
-    onGround = false,
-    wasOnGround = false,    -- 上一帧是否在地面
-    gravityLevel = 3,
-    coyoteTimer = 0,
-    jumpBufferTimer = 0,
-    jumpConsumed = false,   -- 本次跳跃是否已消耗 (防连跳)
-    facing = 1,
-}
 
 -- NanoVG
-local nvgCtx = nil
+---@type any
+local vg = nil
 local fontId = -1
 
--- 缩放
-local scaleX = 1
-local scaleY = 1
+-- 屏幕
+local physW, physH = 0, 0
+local scaleX, scaleY = 1, 1
 
--- UI
+-- 地图 (双层: 基础地形 + 开关覆盖层)
+local map = {}       -- 基础层 (WALL, EMPTY, PLATFORM, SPIKE, CHECKPOINT)
+local switchMap = {} -- 覆盖层 (0=无开关, 11-15=对应重力开关)
+local mapW = Config.DEFAULT_MAP_W
+local mapH = Config.DEFAULT_MAP_H
+local spawnX, spawnY = 3, 20
+local exitX, exitY = 67, 20
+local levelName = "新关卡"
+
+-- 编辑器状态
+local currentTile = Config.TILES.WALL
+local zoom = 1.0
+local panX, panY = 0, 0
+local isDragging = false   -- 左键绘制中
+local isErasing = false    -- 右键清除中
+
+-- 光标
+local cursorTX, cursorTY = 0, 0
+local cursorValid = false
+
+-- 历史
+local history = History.New()
+
+-- 验证结果
+local validationResults = nil
+local showValidation = false
+
+-- 通知
+local notification = nil
+local notifTimer = 0
+
+-- 编辑/试玩模式
+local isPlayMode = false
+
+-- UI引用
+---@type any
 local uiRoot = nil
 
--- ====================================================================
--- 辅助函数: 判断瓦片是否为实心 (平台 + 开关都可站立)
--- ====================================================================
+-- UI 工具栏高度
+local TOOLBAR_H = 36
+local PANEL_W = 130
 
-local function IsSolidTile(tile)
-    return tile == T_SOLID or (tile >= T_SW1 and tile <= T_SW5)
-end
+-- WASD 画布移动速度 (设计像素/秒)
+local PAN_SPEED = 300
 
 -- ====================================================================
 -- 初始化
 -- ====================================================================
 
 function Start()
-    graphics.windowTitle = "五四三二一：重力倒计时 - 关卡编辑器"
+    graphics.windowTitle = "五四三二一 — 关卡编辑器 v3"
 
-    nvgCtx = nvgCreate(1)
-    if not nvgCtx then
-        print("ERROR: Failed to create NanoVG context")
+    physW = graphics:GetWidth()
+    physH = graphics:GetHeight()
+    scaleX = physW / Config.DESIGN_W
+    scaleY = physH / Config.DESIGN_H
+
+    -- NanoVG
+    vg = nvgCreate(1)
+    if not vg then
+        print("ERROR: nvgCreate failed")
         return
     end
+    fontId = nvgCreateFont(vg, "sans", "Fonts/MiSans-Regular.ttf")
 
-    fontId = nvgCreateFont(nvgCtx, "sans", "Fonts/MiSans-Regular.ttf")
+    -- UI
+    UI.Init({
+        fonts = { { family = "sans", weights = { normal = "Fonts/MiSans-Regular.ttf" } } },
+        scale = UI.Scale.DEFAULT,
+    })
+    BuildUI()
 
-    local physW = graphics:GetWidth()
-    local physH = graphics:GetHeight()
-    scaleX = physW / DESIGN_W
-    scaleY = physH / DESIGN_H
+    -- 初始化空白地图
+    InitEmptyMap()
 
-    InitMap()
-    InitUI()
-
+    -- 事件
+    SubscribeToEvent(vg, "NanoVGRender", "HandleNanoVGRender")
     SubscribeToEvent("Update", "HandleUpdate")
-    SubscribeToEvent(nvgCtx, "NanoVGRender", "HandleNanoVGRender")
     SubscribeToEvent("KeyDown", "HandleKeyDown")
     SubscribeToEvent("MouseButtonDown", "HandleMouseDown")
+    SubscribeToEvent("MouseButtonUp", "HandleMouseUp")
+    SubscribeToEvent("MouseMove", "HandleMouseMove")
+    SubscribeToEvent("MouseWheel", "HandleMouseWheel")
 
-    print("=== 关卡编辑器启动 ===")
-    print("[编辑] 1:平台 2-6:开关 7:出生点 8:出口 | 左键:放置 右键:删除")
-    print("[试玩] Tab切换 | WASD/方向键移动 | 空格跳跃 | R重置")
+    -- 重置视图到居中
+    ResetView()
+
+    -- 初始高亮默认元素
+    SetElement(currentTile)
+
+    print("=== 关卡编辑器 v3 启动 ===")
+    print("左键放置 右键清除 WASD移动画布 滚轮缩放")
+    print("Ctrl+Z撤销 Ctrl+Y重做 Ctrl+S保存 Ctrl+E导出")
+    print("Space重置视图 F5试玩")
 end
 
 function Stop()
     UI.Shutdown()
-    if nvgCtx then
-        nvgDelete(nvgCtx)
-        nvgCtx = nil
-    end
+    if vg then nvgDelete(vg) end
 end
 
 -- ====================================================================
--- 地图初始化 (含测试关卡)
+-- 地图初始化
 -- ====================================================================
 
-function InitMap()
-    -- 清空
-    for y = 1, MAP_H do
+function InitEmptyMap()
+    map = {}
+    switchMap = {}
+    for y = 1, mapH do
         map[y] = {}
-        for x = 1, MAP_W do
-            map[y][x] = T_EMPTY
+        switchMap[y] = {}
+        for x = 1, mapW do
+            map[y][x] = Config.TILES.EMPTY
+            switchMap[y][x] = 0
         end
     end
-
-    -- 底部地面 (最后两行)
-    for x = 1, MAP_W do
-        map[MAP_H][x] = T_SOLID
-        map[MAP_H - 1][x] = T_SOLID
+    -- 底部地面
+    for x = 1, mapW do
+        map[mapH][x] = Config.TILES.WALL
+        map[mapH - 1][x] = Config.TILES.WALL
     end
-
-    -- ====== 测试关卡: 验证各等级跳跃高度 ======
-    -- 地面行 = MAP_H - 2 (玩家站在此行顶部)
-    local groundRow = MAP_H - 2
-
-    -- 区段1: 开关[5] + 5格高墙 (x=8-12)
-    map[groundRow][8] = T_SW5
-    for h = 0, 4 do
-        map[groundRow - h][12] = T_SOLID
-    end
-
-    -- 区段2: 开关[4] + 4格高墙 (x=18-22)
-    map[groundRow][18] = T_SW4
-    for h = 0, 3 do
-        map[groundRow - h][22] = T_SOLID
-    end
-
-    -- 区段3: 开关[3] + 3格高墙 (x=28-32)
-    map[groundRow][28] = T_SW3
-    for h = 0, 2 do
-        map[groundRow - h][32] = T_SOLID
-    end
-
-    -- 区段4: 开关[2] + 2格高墙 (x=38-42)
-    map[groundRow][38] = T_SW2
-    for h = 0, 1 do
-        map[groundRow - h][42] = T_SOLID
-    end
-
-    -- 区段5: 开关[1] + 1格高墙 (x=48-52)
-    map[groundRow][48] = T_SW1
-    map[groundRow][52] = T_SOLID
-
-    -- 出生点/出口
-    editor.spawnX = 3
-    editor.spawnY = groundRow
-    editor.exitX = MAP_W - 3
-    editor.exitY = groundRow
-
-    -- 编辑器初始相机对准地面区域
-    editor.cameraY = math.max(0, MAP_H * TILE - DESIGN_H)
-
-    print("[测试关卡] 5个区段，每个区段有对应等级开关+对应高度墙壁")
-    print("  踩开关 → 跳过墙壁 = 该等级验证通过")
-    print("  地图高度: " .. MAP_H .. " 格 (" .. MAP_H * TILE .. "px)，WASD滚动编辑")
+    spawnX, spawnY = 3, mapH - 2
+    exitX, exitY = mapW - 3, mapH - 2
+    history:Clear()
+    validationResults = nil
 end
 
 -- ====================================================================
--- 一键清空地图 (保留地面)
+-- 视图控制
 -- ====================================================================
 
-function ClearMap()
-    for y = 1, MAP_H - 2 do
-        for x = 1, MAP_W do
-            map[y][x] = T_EMPTY
-        end
-    end
-    print("[编辑器] 地图已清空（保留底部地面）")
+function ResetView()
+    zoom = 1.0
+    -- 居中显示地图
+    local mapPixW = mapW * Config.TILE
+    local mapPixH = mapH * Config.TILE
+    local canvasW = Config.DESIGN_W - PANEL_W
+    local canvasH = Config.DESIGN_H - TOOLBAR_H
+    panX = (canvasW - mapPixW * zoom) / 2 + PANEL_W
+    panY = (canvasH - mapPixH * zoom) / 2 + TOOLBAR_H
+end
+
+function ScreenToTile(sx, sy)
+    -- 屏幕坐标 → 设计坐标 → 瓦片坐标
+    local dx = sx / scaleX
+    local dy = sy / scaleY
+    local worldX = (dx - panX) / zoom
+    local worldY = (dy - panY) / zoom
+    local tx = math.floor(worldX / Config.TILE) + 1
+    local ty = math.floor(worldY / Config.TILE) + 1
+    return tx, ty
 end
 
 -- ====================================================================
--- UI
+-- UI构建
 -- ====================================================================
 
-function InitUI()
-    UI.Init({
-        fonts = {
-            { family = "sans", weights = { normal = "Fonts/MiSans-Regular.ttf" } }
-        },
-        scale = UI.Scale.DEFAULT,
-    })
+function BuildUI()
+    local elementButtons = {}
+    for _, e in ipairs(Config.ELEMENTS) do
+        table.insert(elementButtons, UI.Button {
+            id = "elem_" .. e.id,
+            text = e.name .. "[" .. e.key .. "]",
+            fontSize = 9,
+            height = 20,
+            paddingLeft = 4, paddingRight = 4,
+            onClick = function() SetElement(e.id) end,
+        })
+    end
 
-    uiRoot = UI.Panel {
-        width = "100%",
-        height = "100%",
+    local root = UI.Panel {
+        width = "100%", height = "100%",
         pointerEvents = "box-none",
         children = {
             -- 顶部工具栏
             UI.Panel {
                 id = "toolbar",
-                width = "100%",
-                height = 32,
+                width = "100%", height = TOOLBAR_H,
                 flexDirection = "row",
                 alignItems = "center",
-                paddingLeft = 8,
-                paddingRight = 8,
-                gap = 6,
-                backgroundColor = { 15, 20, 35, 230 },
+                paddingLeft = 6, paddingRight = 6, gap = 4,
+                backgroundColor = { 20, 25, 45, 240 },
                 children = {
-                    UI.Label {
-                        id = "modeLabel",
-                        text = "[编辑]",
-                        fontSize = 12,
-                        fontColor = { 100, 255, 200, 255 },
-                    },
-                    UI.Label {
-                        id = "toolLabel",
-                        text = "工具: 实心平台",
-                        fontSize = 11,
-                        fontColor = { 200, 210, 230, 255 },
-                    },
-                    UI.Label {
-                        id = "gravityLabel",
-                        text = "",
-                        fontSize = 11,
-                        fontColor = { 255, 234, 0, 255 },
+                    -- 操作按钮
+                    UI.Button { text = "验证[V]", fontSize = 9, height = 22, paddingLeft = 5, paddingRight = 5,
+                        onClick = function() RunValidation() end },
+                    UI.Button { text = "保存", fontSize = 9, height = 22, paddingLeft = 5, paddingRight = 5,
+                        onClick = function() SaveCurrentLevel() end },
+                    UI.Button { text = "导出JSON", fontSize = 9, height = 22, paddingLeft = 5, paddingRight = 5,
+                        onClick = function() ExportLevel() end },
+                    UI.Button { text = "清空", fontSize = 9, height = 22, paddingLeft = 5, paddingRight = 5,
+                        variant = "danger",
+                        onClick = function() ClearCurrentMap() end },
+                    -- 分隔
+                    UI.Panel { width = 1, height = 20, backgroundColor = { 60, 70, 100, 150 } },
+                    -- 试玩按钮
+                    UI.Button { id = "playBtn", text = "试玩[F5]", fontSize = 9, height = 22,
+                        paddingLeft = 6, paddingRight = 6,
+                        variant = "primary",
+                        onClick = function() TogglePlayMode() end },
+                    -- 弹性空间
+                    UI.Panel { flexGrow = 1 },
+                    -- 状态信息
+                    UI.Label { id = "statusLabel", text = "...", fontSize = 9,
+                        fontColor = { 180, 190, 210, 220 } },
+                }
+            },
+            -- 左侧面板
+            UI.Panel {
+                id = "leftPanel",
+                width = PANEL_W, height = Config.DESIGN_H - TOOLBAR_H,
+                position = "absolute",
+                left = 0, top = TOOLBAR_H,
+                backgroundColor = { 15, 20, 38, 230 },
+                paddingTop = 6, paddingLeft = 6, paddingRight = 6,
+                gap = 4,
+                children = {
+                    UI.Label { text = "元素 (左键放置 右键清除)", fontSize = 9, fontColor = { 0, 229, 255, 255 } },
+                    UI.Panel {
+                        flexDirection = "row", flexWrap = "wrap", gap = 2,
+                        children = elementButtons,
                     },
                     UI.Panel { flexGrow = 1 },
-                    UI.Button {
-                        id = "clearBtn",
-                        text = "清空地图",
-                        fontSize = 10,
-                        height = 22,
-                        paddingLeft = 8,
-                        paddingRight = 8,
-                        variant = "danger",
-                        onClick = function()
-                            ClearMap()
-                        end,
-                    },
-                    UI.Label {
-                        id = "helpLabel",
-                        text = "Tab:切换 | 1-8:工具 | 左键放置 右键删除 | WASD滚动",
-                        fontSize = 9,
-                        fontColor = { 130, 140, 160, 180 },
-                    },
-                },
+                    UI.Label { id = "infoLabel", text = "缩放:1.0x", fontSize = 8,
+                        fontColor = { 100, 110, 130, 180 } },
+                }
             },
-        },
+        }
     }
-
-    UI.SetRoot(uiRoot)
+    uiRoot = root
+    UI.SetRoot(root)
+    UpdateStatusUI()
 end
 
 -- ====================================================================
--- 更新
+-- UI 更新
+-- ====================================================================
+
+function UpdateStatusUI()
+    if not uiRoot then return end
+    local label = uiRoot:FindById("statusLabel")
+    if label then
+        if isPlayMode then
+            local ps = PlayMode.GetState()
+            local gInfo = Config.GRAVITY_LEVELS[ps.gravityLevel]
+            label:SetText(string.format("试玩中 | %s | 重力%d(%s)",
+                levelName, ps.gravityLevel, gInfo.name))
+        else
+            local text = string.format("%s | %dx%d | %s | 撤销:%d 重做:%d",
+                levelName, mapW, mapH,
+                GetTileName(currentTile),
+                history:GetUndoCount(), history:GetRedoCount())
+            label:SetText(text)
+        end
+    end
+    -- 更新试玩按钮文本
+    local playBtn = uiRoot:FindById("playBtn")
+    if playBtn then
+        playBtn:SetText(isPlayMode and "返回编辑[F5]" or "试玩[F5]")
+    end
+end
+
+function UpdateInfoLabel()
+    if not uiRoot then return end
+    local label = uiRoot:FindById("infoLabel")
+    if label then
+        label:SetText(string.format("缩放:%.1fx 格:%d,%d", zoom, cursorTX, cursorTY))
+    end
+end
+
+function GetTileName(tileId)
+    for _, e in ipairs(Config.ELEMENTS) do
+        if e.id == tileId then return e.name end
+    end
+    return "未知"
+end
+
+function ShowNotification(msg)
+    notification = msg
+    notifTimer = 3.0
+end
+
+-- ====================================================================
+-- 元素选择
+-- ====================================================================
+
+function SetElement(tileId)
+    currentTile = tileId
+    UpdateStatusUI()
+    -- 高亮选中的元素按钮
+    if uiRoot then
+        for _, e in ipairs(Config.ELEMENTS) do
+            local btn = uiRoot:FindById("elem_" .. e.id)
+            if btn then
+                if e.id == tileId then
+                    btn:SetVariant("primary")
+                else
+                    btn:SetVariant("default")
+                end
+            end
+        end
+    end
+end
+
+-- ====================================================================
+-- 试玩模式切换
+-- ====================================================================
+
+function TogglePlayMode()
+    if isPlayMode then
+        -- 退出试玩
+        PlayMode.Exit()
+        isPlayMode = false
+        ShowNotification("编辑模式")
+    else
+        -- 进入试玩
+        isPlayMode = true
+        PlayMode.Enter(map, switchMap, mapW, mapH, spawnX, spawnY, exitX, exitY)
+        ShowNotification("试玩模式 — ESC退出")
+    end
+    UpdateStatusUI()
+end
+
+-- ====================================================================
+-- 绘制操作
+-- ====================================================================
+
+--- 放置当前元素
+function PlaceTile(tx, ty)
+    if tx < 1 or tx > mapW or ty < 1 or ty > mapH then return end
+
+    -- 起点/出口特殊处理(只能有一个)
+    if currentTile == Config.TILES.SPAWN then
+        spawnX, spawnY = tx, ty
+        print(string.format("[编辑器] 起点设置为 (%d,%d)", tx, ty))
+        ShowNotification(string.format("起点已设置 (%d,%d)", tx, ty))
+        UpdateStatusUI()
+        return
+    elseif currentTile == Config.TILES.EXIT then
+        exitX, exitY = tx, ty
+        print(string.format("[编辑器] 出口设置为 (%d,%d)", tx, ty))
+        ShowNotification(string.format("出口已设置 (%d,%d)", tx, ty))
+        UpdateStatusUI()
+        return
+    end
+
+    -- 开关类型: 写入覆盖层 (不改变基础层)
+    if Config.IsSwitch(currentTile) then
+        local oldSwitch = switchMap[ty][tx]
+        if oldSwitch ~= currentTile then
+            local changes = { { x = tx, y = ty, oldTile = oldSwitch, newTile = currentTile, layer = "switch" } }
+            switchMap[ty][tx] = currentTile
+            history:Push(changes)
+            UpdateStatusUI()
+        end
+        return
+    end
+
+    -- 普通瓦片: 写入基础层
+    local changes = Tools.Brush(map, tx, ty, currentTile, mapW, mapH)
+    if #changes > 0 then
+        history:Push(changes)
+        UpdateStatusUI()
+    end
+end
+
+--- 清除瓦片（右键）— 优先清除覆盖层，若无覆盖则清基础层
+function EraseTile(tx, ty)
+    if tx < 1 or tx > mapW or ty < 1 or ty > mapH then return end
+
+    -- 优先清除覆盖层的开关
+    if switchMap[ty][tx] ~= 0 then
+        local oldSwitch = switchMap[ty][tx]
+        switchMap[ty][tx] = 0
+        local changes = { { x = tx, y = ty, oldTile = oldSwitch, newTile = 0, layer = "switch" } }
+        history:Push(changes)
+        UpdateStatusUI()
+        return
+    end
+
+    -- 覆盖层为空，清除基础层
+    local changes = Tools.Eraser(map, tx, ty, mapW, mapH)
+    if #changes > 0 then
+        history:Push(changes)
+        UpdateStatusUI()
+    end
+end
+
+-- ====================================================================
+-- 撤销/重做
+-- ====================================================================
+
+function Undo()
+    local action = history:Undo()
+    if action then
+        for _, ch in ipairs(action) do
+            if ch.x >= 1 and ch.x <= mapW and ch.y >= 1 and ch.y <= mapH then
+                if ch.layer == "switch" then
+                    switchMap[ch.y][ch.x] = ch.oldTile
+                else
+                    map[ch.y][ch.x] = ch.oldTile
+                end
+            end
+        end
+        UpdateStatusUI()
+        ShowNotification("撤销")
+    end
+end
+
+function Redo()
+    local action = history:Redo()
+    if action then
+        for _, ch in ipairs(action) do
+            if ch.x >= 1 and ch.x <= mapW and ch.y >= 1 and ch.y <= mapH then
+                if ch.layer == "switch" then
+                    switchMap[ch.y][ch.x] = ch.newTile
+                else
+                    map[ch.y][ch.x] = ch.newTile
+                end
+            end
+        end
+        UpdateStatusUI()
+        ShowNotification("重做")
+    end
+end
+
+-- ====================================================================
+-- 验证
+-- ====================================================================
+
+function RunValidation()
+    validationResults = Validator.Validate(map, switchMap, mapW, mapH, spawnX, spawnY, exitX, exitY)
+    showValidation = true
+    if validationResults.passed then
+        ShowNotification("验证通过!")
+    else
+        ShowNotification("验证失败 — 查看详情")
+    end
+end
+
+-- ====================================================================
+-- 保存/导出
+-- ====================================================================
+
+function SaveCurrentLevel()
+    local filename = "level_" .. os.time() .. ".json"
+    local ok, path = Storage.SaveToFile(filename, map, switchMap, mapW, mapH, spawnX, spawnY, exitX, exitY, levelName)
+    if ok then
+        Storage.UpdateIndex(filename, levelName)
+        ShowNotification("已保存: " .. path)
+    else
+        ShowNotification("保存失败: " .. path)
+    end
+end
+
+function ExportLevel()
+    local json = Storage.ExportJSON(map, switchMap, mapW, mapH, spawnX, spawnY, exitX, exitY, levelName)
+    -- 写入导出文件
+    local file = File("export_level.json", FILE_WRITE)
+    if file:IsOpen() then
+        file:WriteString(json)
+        file:Close()
+        ShowNotification("已导出: export_level.json (可复制)")
+        print("=== 导出JSON ===")
+        print(json)
+    else
+        ShowNotification("导出失败")
+    end
+end
+
+function ClearCurrentMap()
+    -- 保存当前状态到历史 (整个地图作为一次操作)
+    local changes = {}
+    for y = 1, mapH do
+        for x = 1, mapW do
+            if map[y][x] ~= Config.TILES.EMPTY then
+                table.insert(changes, { x = x, y = y, oldTile = map[y][x], newTile = Config.TILES.EMPTY })
+            end
+            if switchMap[y][x] ~= 0 then
+                table.insert(changes, { x = x, y = y, oldTile = switchMap[y][x], newTile = 0, layer = "switch" })
+            end
+        end
+    end
+    if #changes > 0 then
+        history:Push(changes)
+    end
+    -- 清空基础层和覆盖层
+    for y = 1, mapH do
+        for x = 1, mapW do
+            map[y][x] = Config.TILES.EMPTY
+            switchMap[y][x] = 0
+        end
+    end
+    -- 重建地面
+    for x = 1, mapW do
+        map[mapH][x] = Config.TILES.WALL
+        map[mapH - 1][x] = Config.TILES.WALL
+    end
+    ShowNotification("地图已清空")
+    UpdateStatusUI()
+end
+
+-- ====================================================================
+-- 事件: Update
 -- ====================================================================
 
 ---@param eventType string
 ---@param eventData UpdateEventData
 function HandleUpdate(eventType, eventData)
     local dt = eventData["TimeStep"]:GetFloat()
-    -- 限制最大 dt 防止物理爆炸
-    dt = math.min(dt, 1 / 30)
 
-    if gameMode == MODE_PLAY then
-        UpdatePlayer(dt)
-    else
-        UpdateEditor(dt)
-    end
-end
-
--- ====================================================================
--- 编辑器
--- ====================================================================
-
-function UpdateEditor(dt)
-    local scrollSpeed = 300
-    if input:GetKeyDown(KEY_A) or input:GetKeyDown(KEY_LEFT) then
-        editor.cameraX = math.max(0, editor.cameraX - scrollSpeed * dt)
-    end
-    if input:GetKeyDown(KEY_D) or input:GetKeyDown(KEY_RIGHT) then
-        local maxCam = math.max(0, MAP_W * TILE - DESIGN_W)
-        editor.cameraX = math.min(maxCam, editor.cameraX + scrollSpeed * dt)
-    end
-    if input:GetKeyDown(KEY_W) or input:GetKeyDown(KEY_UP) then
-        editor.cameraY = math.max(0, editor.cameraY - scrollSpeed * dt)
-    end
-    if input:GetKeyDown(KEY_S) or input:GetKeyDown(KEY_DOWN) then
-        local maxCamY = math.max(0, MAP_H * TILE - DESIGN_H)
-        editor.cameraY = math.min(maxCamY, editor.cameraY + scrollSpeed * dt)
-    end
-
-    -- 持续绘制/擦除
-    if input:GetMouseButtonDown(MOUSEB_LEFT) then
-        PlaceTileAtMouse()
-    end
-    if input:GetMouseButtonDown(MOUSEB_RIGHT) then
-        EraseTileAtMouse()
-    end
-end
-
-function PlaceTileAtMouse()
-    local tx, ty = MouseToTile()
-    if tx < 1 or tx > MAP_W or ty < 1 or ty > MAP_H then return end
-
-    if editor.tool == T_SPAWN then
-        editor.spawnX = tx
-        editor.spawnY = ty
-    elseif editor.tool == T_EXIT then
-        editor.exitX = tx
-        editor.exitY = ty
-    else
-        map[ty][tx] = editor.tool
-    end
-end
-
-function EraseTileAtMouse()
-    local tx, ty = MouseToTile()
-    if tx < 1 or tx > MAP_W or ty < 1 or ty > MAP_H then return end
-    map[ty][tx] = T_EMPTY
-end
-
-function MouseToTile()
-    local mx = input.mousePosition.x
-    local my = input.mousePosition.y
-    local dx = mx / scaleX
-    local dy = my / scaleY
-    local tx = math.floor((dx + editor.cameraX) / TILE) + 1
-    local ty = math.floor((dy + editor.cameraY) / TILE) + 1
-    return tx, ty
-end
-
--- ====================================================================
--- 玩家物理 (核心!)
--- ====================================================================
-
-function UpdatePlayer(dt)
-    local grav = GRAVITY_LEVELS[player.gravityLevel].gravity
-
-    -- ===== 输入 =====
-    local moveDir = 0
-    if input:GetKeyDown(KEY_A) or input:GetKeyDown(KEY_LEFT) then
-        moveDir = -1
-    elseif input:GetKeyDown(KEY_D) or input:GetKeyDown(KEY_RIGHT) then
-        moveDir = 1
-    end
-
-    -- ===== 水平移动 =====
-    local maxSpeed = player.onGround and GROUND_SPEED or AIR_SPEED
-    local accel = player.onGround and GROUND_ACCEL or AIR_ACCEL
-
-    if moveDir ~= 0 then
-        player.vx = player.vx + moveDir * accel * dt
-        if math.abs(player.vx) > maxSpeed then
-            player.vx = moveDir * maxSpeed
+    -- 通知倒计时
+    if notifTimer > 0 then
+        notifTimer = notifTimer - dt
+        if notifTimer <= 0 then
+            notification = nil
         end
-        player.facing = moveDir
-    else
-        -- 摩擦
-        local decay = player.onGround and FRICTION or (FRICTION * 0.3)
-        player.vx = player.vx * math.max(0, 1 - decay * dt)
-        if math.abs(player.vx) < 2 then player.vx = 0 end
     end
 
-    -- ===== 跳跃 (边沿检测) =====
-    -- 使用 GetKeyPress 实现单次触发
-    local jumpPressed = input:GetKeyPress(KEY_SPACE) or input:GetKeyPress(KEY_W) or input:GetKeyPress(KEY_UP)
-    if jumpPressed then
-        player.jumpBufferTimer = JUMP_BUFFER
-        player.jumpConsumed = false
-    end
-    player.jumpBufferTimer = math.max(0, player.jumpBufferTimer - dt)
+    -- 更新屏幕尺寸
+    physW = graphics:GetWidth()
+    physH = graphics:GetHeight()
+    scaleX = physW / Config.DESIGN_W
+    scaleY = physH / Config.DESIGN_H
 
-    -- 土狼时间
-    if player.onGround then
-        player.coyoteTimer = COYOTE_TIME
-    else
-        player.coyoteTimer = math.max(0, player.coyoteTimer - dt)
-    end
+    -- 试玩模式物理更新
+    if isPlayMode then
+        PlayMode.Update(dt)
 
-    -- 执行跳跃 (缓冲 + 土狼 + 未消耗)
-    if player.jumpBufferTimer > 0 and player.coyoteTimer > 0 and not player.jumpConsumed then
-        player.vy = -JUMP_SPEED
-        player.onGround = false
-        player.coyoteTimer = 0
-        player.jumpBufferTimer = 0
-        player.jumpConsumed = true
-    end
-
-    -- 落地时重置消耗标记
-    if player.onGround then
-        player.jumpConsumed = false
-    end
-
-    -- ===== 重力 (在地面时跳过，消除闲置抖动) =====
-    if player.onGround then
-        -- 在地面时不施加重力，但要检测脚下是否还有地面
-        if not IsGroundBelow() then
-            -- 走出边缘：开始下落
-            player.onGround = false
-            player.vy = 0
-        else
-            -- 确保垂直速度为零，防止残余速度累积
-            player.vy = 0
+        -- 试玩时相机跟随角色
+        local ps = PlayMode.GetState()
+        if ps.active then
+            local canvasW = Config.DESIGN_W - PANEL_W
+            local canvasH = Config.DESIGN_H - TOOLBAR_H
+            local targetPanX = PANEL_W + canvasW / 2 - ps.x * zoom
+            local targetPanY = TOOLBAR_H + canvasH / 2 - ps.y * zoom
+            -- 平滑跟随
+            panX = panX + (targetPanX - panX) * math.min(1, dt * 6)
+            panY = panY + (targetPanY - panY) * math.min(1, dt * 6)
         end
     else
-        player.vy = player.vy + grav * dt
-        -- 限制最大下落速度
-        if player.vy > MAX_FALL_SPEED then
-            player.vy = MAX_FALL_SPEED
-        end
-    end
-
-    -- ===== 移动 + 碰撞检测 =====
-    ResolveMovement(dt)
-
-    -- ===== 开关检测 (站在开关上时触发) =====
-    CheckGravitySwitches()
-
-    -- ===== 出口 =====
-    CheckExit()
-
-    -- ===== 相机 (水平 + 垂直跟随) =====
-    -- 水平
-    local camTargetX = player.x - DESIGN_W / 2 + PLAYER_W / 2
-    local maxCamX = math.max(0, MAP_W * TILE - DESIGN_W)
-    editor.cameraX = math.max(0, math.min(maxCamX, camTargetX))
-
-    -- 垂直 (允许负值跟随跳出地图顶部的玩家)
-    local camTargetY = player.y - DESIGN_H / 2 + PLAYER_H / 2
-    local maxCamY = math.max(0, MAP_H * TILE - DESIGN_H)
-    editor.cameraY = math.max(-DESIGN_H / 2, math.min(maxCamY, camTargetY))
-end
-
--- ====================================================================
--- 碰撞解算 (分轴 + 精确对齐)
--- ====================================================================
-
-function ResolveMovement(dt)
-    -- ===== 水平 =====
-    local dx = player.vx * dt
-    if dx ~= 0 then
-        local newX = player.x + dx
-        if not CheckCollision(newX, player.y) then
-            player.x = newX
-        else
-            -- 贴墙对齐
-            if dx > 0 then
-                -- 向右: 对齐到碰撞瓦片左边
-                local rightEdge = player.x + PLAYER_W
-                local nextTileX = math.floor((rightEdge + dx) / TILE) * TILE
-                player.x = nextTileX - PLAYER_W - 0.01
-            else
-                -- 向左: 对齐到碰撞瓦片右边
-                local leftEdge = player.x + dx
-                local nextTileX = (math.floor(leftEdge / TILE) + 1) * TILE
-                player.x = nextTileX + 0.01
-            end
-            player.vx = 0
-        end
-    end
-
-    -- ===== 垂直 =====
-    local dy = player.vy * dt
-    player.wasOnGround = player.onGround
-
-    if dy ~= 0 then
-        local newY = player.y + dy
-        if not CheckCollision(player.x, newY) then
-            player.y = newY
-            player.onGround = false
-        else
-            if dy > 0 then
-                -- 下落: 对齐到平台顶部
-                local bottomEdge = player.y + PLAYER_H + dy
-                local landTileY = math.floor(bottomEdge / TILE) * TILE
-                player.y = landTileY - PLAYER_H
-                player.onGround = true
-            else
-                -- 上升撞顶: 对齐到天花板底部
-                local topEdge = player.y + dy
-                local ceilTileY = (math.floor(topEdge / TILE) + 1) * TILE
-                player.y = ceilTileY
-            end
-            player.vy = 0
-        end
-    end
-
-    -- 掉出地图
-    if player.y > MAP_H * TILE + 100 then
-        ResetPlayer()
-    end
-end
-
-function CheckCollision(x, y)
-    -- AABB vs 瓦片地图碰撞
-    -- 收缩 2px 避免卡角
-    local shrink = 2
-    local left   = math.floor((x + shrink) / TILE) + 1
-    local right  = math.floor((x + PLAYER_W - shrink) / TILE) + 1
-    local top    = math.floor((y + shrink) / TILE) + 1
-    local bottom = math.floor((y + PLAYER_H - shrink) / TILE) + 1
-
-    for ty = top, bottom do
-        for tx = left, right do
-            if tx >= 1 and tx <= MAP_W and ty >= 1 and ty <= MAP_H then
-                if IsSolidTile(map[ty][tx]) then
-                    return true
-                end
-            end
-        end
-    end
-    return false
-end
-
--- ====================================================================
--- 地面持续检测 (玩家脚下 1px 是否还有实心瓦片)
--- ====================================================================
-
-function IsGroundBelow()
-    -- 检查玩家底部向下 1px 位置是否有实心瓦片
-    local shrink = 2
-    local checkY = player.y + PLAYER_H + 1  -- 脚下 1px
-    local left  = math.floor((player.x + shrink) / TILE) + 1
-    local right = math.floor((player.x + PLAYER_W - shrink) / TILE) + 1
-    local row   = math.floor(checkY / TILE) + 1
-
-    for tx = left, right do
-        if tx >= 1 and tx <= MAP_W and row >= 1 and row <= MAP_H then
-            if IsSolidTile(map[row][tx]) then
-                return true
-            end
-        end
-    end
-    return false
-end
-
--- ====================================================================
--- 重力开关检测 (玩家站在开关瓦片顶部时触发)
--- ====================================================================
-
-function CheckGravitySwitches()
-    if not player.onGround then return end
-
-    -- 检查玩家正下方的瓦片 (脚下一行)
-    local footRow = math.floor((player.y + PLAYER_H + 1) / TILE) + 1
-    local leftCol = math.floor((player.x + 4) / TILE) + 1
-    local rightCol = math.floor((player.x + PLAYER_W - 4) / TILE) + 1
-
-    for tx = leftCol, rightCol do
-        if tx >= 1 and tx <= MAP_W and footRow >= 1 and footRow <= MAP_H then
-            local tile = map[footRow][tx]
-            if tile >= T_SW1 and tile <= T_SW5 then
-                local level = tile - 10
-                if player.gravityLevel ~= level then
-                    player.gravityLevel = level
-                    UpdateGravityUI()
-                end
-                return
-            end
-        end
+        -- 编辑模式: WASD 移动画布
+        local speed = PAN_SPEED * dt
+        if input:GetKeyDown(KEY_W) then panY = panY + speed end
+        if input:GetKeyDown(KEY_S) then panY = panY - speed end
+        if input:GetKeyDown(KEY_A) then panX = panX + speed end
+        if input:GetKeyDown(KEY_D) then panX = panX - speed end
     end
 end
 
 -- ====================================================================
--- 出口检测
--- ====================================================================
-
-function CheckExit()
-    -- 玩家中心与出口瓦片中心的距离判定
-    local px = player.x + PLAYER_W / 2
-    local py = player.y + PLAYER_H / 2
-    local ex = (editor.exitX - 1) * TILE + TILE / 2
-    local ey = (editor.exitY - 1) * TILE + TILE / 2
-    local dist = math.sqrt((px - ex) ^ 2 + (py - ey) ^ 2)
-    if dist < TILE * 0.6 then
-        print("=== 到达出口! ===")
-        ResetPlayer()
-    end
-end
-
--- ====================================================================
--- 重置玩家
--- ====================================================================
-
-function ResetPlayer()
-    player.x = (editor.spawnX - 1) * TILE + (TILE - PLAYER_W) / 2
-    player.y = (editor.spawnY - 1) * TILE - PLAYER_H
-    player.vx = 0
-    player.vy = 0
-    player.onGround = false
-    player.wasOnGround = false
-    player.gravityLevel = 3
-    player.coyoteTimer = 0
-    player.jumpBufferTimer = 0
-    player.jumpConsumed = false
-    UpdateGravityUI()
-end
-
--- ====================================================================
--- 模式切换
--- ====================================================================
-
-function SwitchToPlay()
-    gameMode = MODE_PLAY
-    ResetPlayer()
-    local label = uiRoot:FindById("modeLabel")
-    if label then label:SetText("[试玩]") end
-    local help = uiRoot:FindById("helpLabel")
-    if help then help:SetText("WASD移动 | 空格跳跃 | R重置 | Tab返回编辑") end
-    UpdateGravityUI()
-end
-
-function SwitchToEdit()
-    gameMode = MODE_EDIT
-    local label = uiRoot:FindById("modeLabel")
-    if label then label:SetText("[编辑]") end
-    local help = uiRoot:FindById("helpLabel")
-    if help then help:SetText("Tab:切换 | 1-8:工具 | 左键放置 右键删除 | AD滚动") end
-    local gLabel = uiRoot:FindById("gravityLabel")
-    if gLabel then gLabel:SetText("") end
-end
-
-function UpdateGravityUI()
-    local gLabel = uiRoot:FindById("gravityLabel")
-    if gLabel then
-        local g = GRAVITY_LEVELS[player.gravityLevel]
-        gLabel:SetText("重力: " .. g.name .. " [" .. player.gravityLevel .. "]")
-    end
-end
-
--- ====================================================================
--- 输入
+-- 事件: 键盘
 -- ====================================================================
 
 ---@param eventType string
 ---@param eventData KeyDownEventData
 function HandleKeyDown(eventType, eventData)
     local key = eventData["Key"]:GetInt()
+    local qual = eventData["Qualifiers"]:GetInt()
+    local ctrl = (qual & QUAL_CTRL) ~= 0
 
-    if key == KEY_TAB then
-        if gameMode == MODE_EDIT then
-            SwitchToPlay()
-        else
-            SwitchToEdit()
-        end
+    -- F5: 切换试玩模式 (任何时候可用)
+    if key == KEY_F5 then
+        TogglePlayMode()
         return
     end
 
-    if key == KEY_R and gameMode == MODE_PLAY then
-        ResetPlayer()
-        return
-    end
-
-    -- 编辑器工具
-    if gameMode == MODE_EDIT then
-        if key == KEY_1 then editor.tool = T_SOLID
-        elseif key == KEY_2 then editor.tool = T_SW5
-        elseif key == KEY_3 then editor.tool = T_SW4
-        elseif key == KEY_4 then editor.tool = T_SW3
-        elseif key == KEY_5 then editor.tool = T_SW2
-        elseif key == KEY_6 then editor.tool = T_SW1
-        elseif key == KEY_7 then editor.tool = T_SPAWN
-        elseif key == KEY_8 then editor.tool = T_EXIT
+    -- 试玩模式按键
+    if isPlayMode then
+        if key == KEY_ESCAPE then
+            TogglePlayMode()  -- ESC退出试玩
+        elseif key == KEY_R then
+            PlayMode.Respawn()
+            ShowNotification("重生")
         end
-        UpdateToolLabel()
+        return  -- 试玩模式下不处理编辑器快捷键
+    end
+
+    -- === 以下仅编辑模式 ===
+
+    -- Ctrl 快捷键
+    if ctrl then
+        if key == KEY_Z then Undo() return end
+        if key == KEY_Y then Redo() return end
+        if key == KEY_S then SaveCurrentLevel() return end
+        if key == KEY_E then ExportLevel() return end
+    end
+
+    -- 元素快捷键 (数字键等)
+    for _, e in ipairs(Config.ELEMENTS) do
+        if key == e.hotkey then
+            SetElement(e.id)
+            return
+        end
+    end
+
+    -- 其他快捷键
+    if key == KEY_SPACE then
+        ResetView()
+        ShowNotification("视图已重置")
+    elseif key == KEY_V then
+        RunValidation()
+    elseif key == KEY_ESCAPE then
+        showValidation = false
     end
 end
 
-function UpdateToolLabel()
-    local names = {
-        [T_SOLID] = "实心平台",
-        [T_SW5]   = "开关:超轻(5)青",
-        [T_SW4]   = "开关:轻(4)绿",
-        [T_SW3]   = "开关:正常(3)黄",
-        [T_SW2]   = "开关:重(2)橙",
-        [T_SW1]   = "开关:超重(1)红",
-        [T_SPAWN] = "出生点",
-        [T_EXIT]  = "出口",
-    }
-    local label = uiRoot:FindById("toolLabel")
-    if label then
-        label:SetText("工具: " .. (names[editor.tool] or "未知"))
-    end
-end
+-- ====================================================================
+-- 事件: 鼠标
+-- ====================================================================
 
 ---@param eventType string
 ---@param eventData MouseButtonDownEventData
 function HandleMouseDown(eventType, eventData)
-    if gameMode ~= MODE_EDIT then return end
-    local button = eventData["Button"]:GetInt()
-    if button == MOUSEB_LEFT then
-        PlaceTileAtMouse()
-    elseif button == MOUSEB_RIGHT then
-        EraseTileAtMouse()
+    if isPlayMode then return end
+
+    local btn = eventData["Button"]:GetInt()
+    local mx = eventData["X"]:GetInt()
+    local my = eventData["Y"]:GetInt()
+
+    -- 检查是否在画布区域 (排除工具栏和左侧面板)
+    local dx = mx / scaleX
+    local dy = my / scaleY
+    if dy < TOOLBAR_H or dx < PANEL_W then return end
+
+    local tx, ty = ScreenToTile(mx, my)
+    cursorTX, cursorTY = tx, ty
+    cursorValid = (tx >= 1 and tx <= mapW and ty >= 1 and ty <= mapH)
+
+    if btn == MOUSEB_LEFT then
+        -- 左键: 放置当前元素
+        isDragging = true
+        PlaceTile(tx, ty)
+    elseif btn == MOUSEB_RIGHT then
+        -- 右键: 清除
+        isErasing = true
+        EraseTile(tx, ty)
     end
+end
+
+---@param eventType string
+---@param eventData MouseButtonUpEventData
+function HandleMouseUp(eventType, eventData)
+    if isPlayMode then return end
+
+    local btn = eventData["Button"]:GetInt()
+    if btn == MOUSEB_LEFT then
+        isDragging = false
+    elseif btn == MOUSEB_RIGHT then
+        isErasing = false
+    end
+end
+
+---@param eventType string
+---@param eventData MouseMoveEventData
+function HandleMouseMove(eventType, eventData)
+    if isPlayMode then return end
+
+    local mx = eventData["X"]:GetInt()
+    local my = eventData["Y"]:GetInt()
+
+    -- 更新光标瓦片位置
+    local tx, ty = ScreenToTile(mx, my)
+    cursorTX, cursorTY = tx, ty
+    cursorValid = (tx >= 1 and tx <= mapW and ty >= 1 and ty <= mapH)
+    UpdateInfoLabel()
+
+    if isDragging then
+        -- 持续放置
+        PlaceTile(tx, ty)
+    elseif isErasing then
+        -- 持续清除
+        EraseTile(tx, ty)
+    end
+end
+
+---@param eventType string
+---@param eventData MouseWheelEventData
+function HandleMouseWheel(eventType, eventData)
+    if isPlayMode then return end
+
+    local wheel = eventData["Wheel"]:GetInt()
+    local mx = input.mousePosition.x
+    local my = input.mousePosition.y
+
+    -- 检查是否在画布区域
+    local dx = mx / scaleX
+    local dy = my / scaleY
+    if dy < TOOLBAR_H or dx < PANEL_W then return end
+
+    local prevZoom = zoom
+    if wheel > 0 then
+        zoom = math.min(Config.ZOOM_MAX, zoom * Config.ZOOM_STEP)
+    else
+        zoom = math.max(Config.ZOOM_MIN, zoom / Config.ZOOM_STEP)
+    end
+
+    -- 缩放到鼠标位置
+    local worldMX = dx - panX
+    local worldMY = dy - panY
+    panX = panX + worldMX * (1 - zoom / prevZoom)
+    panY = panY + worldMY * (1 - zoom / prevZoom)
+
+    UpdateInfoLabel()
 end
 
 -- ====================================================================
@@ -784,273 +740,458 @@ end
 -- ====================================================================
 
 function HandleNanoVGRender(eventType, eventData)
-    if not nvgCtx then return end
+    if not vg then return end
 
-    local physW = graphics:GetWidth()
-    local physH = graphics:GetHeight()
-    scaleX = physW / DESIGN_W
-    scaleY = physH / DESIGN_H
-
-    nvgBeginFrame(nvgCtx, physW, physH, 1.0)
-
-    -- 设计分辨率缩放
-    nvgSave(nvgCtx)
-    nvgScale(nvgCtx, scaleX, scaleY)
+    nvgBeginFrame(vg, physW, physH, 1.0)
+    nvgSave(vg)
+    nvgScale(vg, scaleX, scaleY)
 
     -- 背景
-    DrawBackground()
+    nvgBeginPath(vg)
+    nvgRect(vg, 0, 0, Config.DESIGN_W, Config.DESIGN_H)
+    nvgFillColor(vg, nvgRGBA(Config.COLORS.BG[1], Config.COLORS.BG[2], Config.COLORS.BG[3], 255))
+    nvgFill(vg)
 
-    -- 相机空间
-    nvgSave(nvgCtx)
-    nvgTranslate(nvgCtx, -editor.cameraX, -editor.cameraY)
+    -- 画布区域裁剪
+    nvgSave(vg)
+    nvgScissor(vg, PANEL_W, TOOLBAR_H, Config.DESIGN_W - PANEL_W, Config.DESIGN_H - TOOLBAR_H)
 
-    -- 网格 (仅编辑模式)
-    if gameMode == MODE_EDIT then
-        DrawGrid()
-    end
+    -- 应用画布变换 (平移+缩放)
+    nvgSave(vg)
+    nvgTranslate(vg, panX, panY)
+    nvgScale(vg, zoom, zoom)
 
-    -- 地图
+    -- 绘制网格
+    DrawGrid()
+    -- 绘制地图
     DrawMap()
+    -- 绘制跳跃范围预览 (编辑模式)
+    if not isPlayMode then
+        DrawJumpPreview()
+    end
+    -- 绘制起点/出口
+    DrawSpawnExit()
 
-    -- 出生点 & 出口
-    DrawSpawnAndExit()
-
-    -- 玩家 (仅试玩)
-    if gameMode == MODE_PLAY then
-        DrawPlayer()
+    if not isPlayMode then
+        -- 绘制光标
+        DrawCursor()
     end
 
-    nvgRestore(nvgCtx)  -- 相机
-
-    -- HUD 层 (不跟随相机)
-    if gameMode == MODE_EDIT then
-        DrawEditorCursor()
-    end
-    if gameMode == MODE_PLAY then
-        DrawGravityHUD()
+    -- 试玩模式: 绘制角色 (在画布变换空间内)
+    if isPlayMode then
+        PlayMode.Draw(vg)
     end
 
-    nvgRestore(nvgCtx)  -- 缩放
-    nvgEndFrame(nvgCtx)
+    nvgRestore(vg)  -- 画布变换
+    nvgResetScissor(vg)
+    nvgRestore(vg)  -- 裁剪
+
+    -- HUD层 (不受画布变换影响)
+    if isPlayMode then
+        PlayMode.DrawHUD(vg, fontId, Config.DESIGN_W, Config.DESIGN_H)
+    end
+    DrawNotification()
+    if not isPlayMode then
+        DrawValidationPanel()
+    end
+
+    nvgRestore(vg)  -- 缩放
+    nvgEndFrame(vg)
 end
 
 -- ====================================================================
--- 绘制
+-- 绘制: 网格
 -- ====================================================================
-
-function DrawBackground()
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, 0, 0, DESIGN_W, DESIGN_H)
-    nvgFillColor(nvgCtx, nvgRGBA(C_BG[1], C_BG[2], C_BG[3], 255))
-    nvgFill(nvgCtx)
-end
 
 function DrawGrid()
-    nvgStrokeWidth(nvgCtx, 0.5)
-    nvgStrokeColor(nvgCtx, nvgRGBA(C_GRID[1], C_GRID[2], C_GRID[3], C_GRID[4]))
+    local TILE = Config.TILE
+    local gc = Config.COLORS.GRID
+    local gmc = Config.COLORS.GRID_MAJOR
 
-    local startX = math.floor(editor.cameraX / TILE) * TILE
-    local startY = math.floor(editor.cameraY / TILE) * TILE
-    for x = startX, startX + DESIGN_W + TILE, TILE do
-        nvgBeginPath(nvgCtx)
-        nvgMoveTo(nvgCtx, x, editor.cameraY)
-        nvgLineTo(nvgCtx, x, editor.cameraY + DESIGN_H)
-        nvgStroke(nvgCtx)
+    nvgStrokeWidth(vg, 0.5)
+
+    -- 计算可见范围
+    local visLeft = -panX / zoom
+    local visTop = -panY / zoom
+    local visW = (Config.DESIGN_W - PANEL_W) / zoom
+    local visH = (Config.DESIGN_H - TOOLBAR_H) / zoom
+
+    local startX = math.max(0, math.floor(visLeft / TILE) * TILE)
+    local startY = math.max(0, math.floor(visTop / TILE) * TILE)
+    local endX = math.min(mapW * TILE, startX + visW + TILE * 2)
+    local endY = math.min(mapH * TILE, startY + visH + TILE * 2)
+
+    for x = startX, endX, TILE do
+        local col = math.floor(x / TILE)
+        if col % 5 == 0 then
+            nvgStrokeColor(vg, nvgRGBA(gmc[1], gmc[2], gmc[3], gmc[4]))
+        else
+            nvgStrokeColor(vg, nvgRGBA(gc[1], gc[2], gc[3], gc[4]))
+        end
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, x, startY)
+        nvgLineTo(vg, x, endY)
+        nvgStroke(vg)
     end
-    for y = startY, startY + DESIGN_H + TILE, TILE do
-        nvgBeginPath(nvgCtx)
-        nvgMoveTo(nvgCtx, editor.cameraX, y)
-        nvgLineTo(nvgCtx, editor.cameraX + DESIGN_W, y)
-        nvgStroke(nvgCtx)
+    for y = startY, endY, TILE do
+        local row = math.floor(y / TILE)
+        if row % 5 == 0 then
+            nvgStrokeColor(vg, nvgRGBA(gmc[1], gmc[2], gmc[3], gmc[4]))
+        else
+            nvgStrokeColor(vg, nvgRGBA(gc[1], gc[2], gc[3], gc[4]))
+        end
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, startX, y)
+        nvgLineTo(vg, endX, y)
+        nvgStroke(vg)
     end
+
+    -- 地图边界
+    nvgBeginPath(vg)
+    nvgRect(vg, 0, 0, mapW * TILE, mapH * TILE)
+    nvgStrokeWidth(vg, 1.5)
+    nvgStrokeColor(vg, nvgRGBA(100, 120, 180, 150))
+    nvgStroke(vg)
 end
 
+-- ====================================================================
+-- 绘制: 地图瓦片
+-- ====================================================================
+
 function DrawMap()
-    local startTX = math.max(1, math.floor(editor.cameraX / TILE))
-    local endTX = math.min(MAP_W, math.floor((editor.cameraX + DESIGN_W) / TILE) + 2)
+    local TILE = Config.TILE
+    local T = Config.TILES
 
-    for ty = 1, MAP_H do
-        for tx = startTX, endTX do
-            local tile = map[ty][tx]
-            if tile ~= T_EMPTY then
-                local px = (tx - 1) * TILE
-                local py = (ty - 1) * TILE
+    -- 基础层
+    for y = 1, mapH do
+        for x = 1, mapW do
+            local tile = map[y][x]
+            if tile ~= T.EMPTY then
+                local px = (x - 1) * TILE
+                local py = (y - 1) * TILE
+                DrawTile(px, py, tile)
+            end
+        end
+    end
 
-                if tile == T_SOLID then
-                    DrawSolidTile(px, py)
-                elseif tile >= T_SW1 and tile <= T_SW5 then
-                    DrawSwitch(px, py, tile - 10)
-                end
+    -- 覆盖层: 开关装饰 (画在瓦片上方)
+    for y = 1, mapH do
+        for x = 1, mapW do
+            local sw = switchMap[y][x]
+            if sw ~= 0 then
+                local px = (x - 1) * TILE
+                local py = (y - 1) * TILE
+                DrawSwitchOverlay(px, py, sw)
             end
         end
     end
 end
 
-function DrawSolidTile(x, y)
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, x, y, TILE, TILE)
-    nvgFillColor(nvgCtx, nvgRGBA(C_PLATFORM[1], C_PLATFORM[2], C_PLATFORM[3], 255))
-    nvgFill(nvgCtx)
-    nvgStrokeWidth(nvgCtx, 1)
-    nvgStrokeColor(nvgCtx, nvgRGBA(50, 60, 100, 180))
-    nvgStroke(nvgCtx)
+function DrawTile(px, py, tileId)
+    local TILE = Config.TILE
+    local T = Config.TILES
+    local C = Config.COLORS
+
+    if tileId == T.WALL then
+        nvgBeginPath(vg)
+        nvgRect(vg, px, py, TILE, TILE)
+        nvgFillColor(vg, nvgRGBA(C.WALL[1], C.WALL[2], C.WALL[3], 255))
+        nvgFill(vg)
+        nvgStrokeWidth(vg, 0.8)
+        nvgStrokeColor(vg, nvgRGBA(C.WALL_STROKE[1], C.WALL_STROKE[2], C.WALL_STROKE[3], C.WALL_STROKE[4]))
+        nvgStroke(vg)
+
+    elseif tileId == T.CHECKPOINT then
+        nvgBeginPath(vg)
+        nvgRect(vg, px + 2, py + 2, TILE - 4, TILE - 4)
+        nvgFillColor(vg, nvgRGBA(C.CHECKPOINT[1], C.CHECKPOINT[2], C.CHECKPOINT[3], 40))
+        nvgFill(vg)
+        nvgStrokeWidth(vg, 1.5)
+        nvgStrokeColor(vg, nvgRGBA(C.CHECKPOINT[1], C.CHECKPOINT[2], C.CHECKPOINT[3], C.CHECKPOINT[4]))
+        nvgStroke(vg)
+        -- 旗帜图标
+        if fontId >= 0 then
+            nvgFontFaceId(vg, fontId)
+            nvgFontSize(vg, 12)
+            nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+            nvgFillColor(vg, nvgRGBA(C.CHECKPOINT[1], C.CHECKPOINT[2], C.CHECKPOINT[3], 255))
+            nvgText(vg, px + TILE/2, py + TILE/2, "CP", nil)
+        end
+
+    elseif tileId == T.SPIKE then
+        -- 三角形尖刺
+        nvgBeginPath(vg)
+        nvgMoveTo(vg, px, py + TILE)
+        nvgLineTo(vg, px + TILE/2, py + 4)
+        nvgLineTo(vg, px + TILE, py + TILE)
+        nvgClosePath(vg)
+        nvgFillColor(vg, nvgRGBA(C.SPIKE[1], C.SPIKE[2], C.SPIKE[3], C.SPIKE[4]))
+        nvgFill(vg)
+
+    elseif tileId == T.PLATFORM then
+        -- 单向平台 (顶部线条 + 虚线)
+        nvgBeginPath(vg)
+        nvgRect(vg, px, py, TILE, 4)
+        nvgFillColor(vg, nvgRGBA(C.PLATFORM[1], C.PLATFORM[2], C.PLATFORM[3], C.PLATFORM[4]))
+        nvgFill(vg)
+        -- 虚线指示
+        nvgStrokeWidth(vg, 1)
+        nvgStrokeColor(vg, nvgRGBA(C.PLATFORM[1], C.PLATFORM[2], C.PLATFORM[3], 100))
+        for i = 0, 2 do
+            nvgBeginPath(vg)
+            nvgMoveTo(vg, px + 4 + i * 10, py + 8)
+            nvgLineTo(vg, px + 4 + i * 10, py + TILE - 4)
+            nvgStroke(vg)
+        end
+    end
 end
 
-function DrawSwitch(x, y, level)
-    local c = GRAVITY_LEVELS[level].color
+-- ====================================================================
+-- 绘制: 覆盖层开关装饰 (半透明六边形按钮)
+-- ====================================================================
 
-    -- 实心底色 (表示可站立)
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, x, y, TILE, TILE)
-    nvgFillColor(nvgCtx, nvgRGBA(C_PLATFORM[1], C_PLATFORM[2], C_PLATFORM[3], 255))
-    nvgFill(nvgCtx)
+function DrawSwitchOverlay(px, py, switchId)
+    local TILE = Config.TILE
+    local C = Config.COLORS
+    local level = Config.GetSwitchLevel(switchId)
+    if not level then return end
+    local gc = C.GRAVITY[level]
 
-    -- 六边形发光层
-    local cx = x + TILE / 2
-    local cy = y + TILE / 2
-    local r = TILE / 2 - 4
-    nvgBeginPath(nvgCtx)
+    -- 半透明圆形底色
+    local cx, cy = px + TILE / 2, py + TILE / 2
+    local r = TILE / 2 - 3
+    nvgBeginPath(vg)
+    nvgCircle(vg, cx, cy, r)
+    nvgFillColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 50))
+    nvgFill(vg)
+
+    -- 六边形轮廓
+    local hr = TILE / 2 - 5
+    nvgBeginPath(vg)
     for i = 0, 5 do
         local angle = math.rad(60 * i - 30)
-        local hx = cx + r * math.cos(angle)
-        local hy = cy + r * math.sin(angle)
-        if i == 0 then nvgMoveTo(nvgCtx, hx, hy)
-        else nvgLineTo(nvgCtx, hx, hy) end
+        local hx = cx + hr * math.cos(angle)
+        local hy = cy + hr * math.sin(angle)
+        if i == 0 then nvgMoveTo(vg, hx, hy) else nvgLineTo(vg, hx, hy) end
     end
-    nvgClosePath(nvgCtx)
-    nvgFillColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 50))
-    nvgFill(nvgCtx)
-    nvgStrokeWidth(nvgCtx, 1.5)
-    nvgStrokeColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 200))
-    nvgStroke(nvgCtx)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 40))
+    nvgFill(vg)
+    nvgStrokeWidth(vg, 1.5)
+    nvgStrokeColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 200))
+    nvgStroke(vg)
 
     -- 数字
-    if fontId ~= -1 then
-        nvgFontFaceId(nvgCtx, fontId)
-        nvgFontSize(nvgCtx, 14)
-        nvgTextAlign(nvgCtx, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFillColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 255))
-        nvgText(nvgCtx, cx, cy, tostring(level), nil)
+    if fontId >= 0 then
+        nvgFontFaceId(vg, fontId)
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 240))
+        nvgText(vg, cx, cy, tostring(level), nil)
     end
 end
 
-function DrawSpawnAndExit()
-    -- 出生点三角
-    local sx = (editor.spawnX - 1) * TILE + TILE / 2
-    local sy = (editor.spawnY - 1) * TILE + TILE / 2
-    nvgBeginPath(nvgCtx)
-    nvgMoveTo(nvgCtx, sx, sy - 10)
-    nvgLineTo(nvgCtx, sx - 8, sy + 6)
-    nvgLineTo(nvgCtx, sx + 8, sy + 6)
-    nvgClosePath(nvgCtx)
-    nvgFillColor(nvgCtx, nvgRGBA(0, 255, 150, 200))
-    nvgFill(nvgCtx)
+-- ====================================================================
+-- 绘制: 跳跃范围预览 (选中开关时高亮该重力下可达瓦片)
+-- ====================================================================
 
-    -- 出口 (单瓦片)
-    local ex = (editor.exitX - 1) * TILE
-    local ey = (editor.exitY - 1) * TILE
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, ex, ey, TILE, TILE)
-    nvgStrokeWidth(nvgCtx, 2)
-    nvgStrokeColor(nvgCtx, nvgRGBA(C_EXIT[1], C_EXIT[2], C_EXIT[3], 200))
-    nvgStroke(nvgCtx)
-    nvgFillColor(nvgCtx, nvgRGBA(C_EXIT[1], C_EXIT[2], C_EXIT[3], 40))
-    nvgFill(nvgCtx)
+function DrawJumpPreview()
+    if not cursorValid then return end
+    -- 仅当选中开关元素时显示对应重力的跳跃范围
+    local level = Config.GetSwitchLevel(currentTile)
+    if not level then return end
 
-    if fontId ~= -1 then
-        nvgFontFaceId(nvgCtx, fontId)
-        nvgFontSize(nvgCtx, 10)
-        nvgTextAlign(nvgCtx, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFillColor(nvgCtx, nvgRGBA(C_EXIT[1], C_EXIT[2], C_EXIT[3], 255))
-        nvgText(nvgCtx, ex + TILE / 2, ey + TILE / 2, "EXIT", nil)
+    local TILE = Config.TILE
+    local C = Config.COLORS
+    local JUMP_SPEED = Config.JUMP_SPEED
+    local AIR_SPEED = 150
+
+    local gInfo = Config.GRAVITY_LEVELS[level]
+    local jumpTiles = gInfo.tiles
+    local gravity = gInfo.gravity
+    local gc = C.GRAVITY[level]
+
+    -- 从光标位置向下找最近地面
+    local groundY = nil
+    for y = cursorTY, mapH do
+        if Config.IsSolid(map[y][cursorTX]) then
+            groundY = y
+            break
+        end
+    end
+    if not groundY then return end
+
+    local standTileY = groundY - 1
+    if standTileY < 1 then return end
+
+    -- 计算水平可达距离
+    local airTime = 2 * JUMP_SPEED / gravity
+    local horizTiles = math.floor(AIR_SPEED * airTime / TILE)
+
+    local topTileY = math.max(1, standTileY - jumpTiles)
+
+    -- 高亮可达瓦片
+    for ty = topTileY, standTileY do
+        local heightAbove = standTileY - ty
+        local vertRatio = heightAbove / jumpTiles
+        local availHoriz = math.floor(horizTiles * math.sqrt(math.max(0, 1 - vertRatio * vertRatio)))
+
+        local rowLeft = math.max(1, cursorTX - availHoriz)
+        local rowRight = math.min(mapW, cursorTX + availHoriz)
+
+        for tx = rowLeft, rowRight do
+            if not Config.IsSolid(map[ty][tx]) then
+                local px = (tx - 1) * TILE
+                local py = (ty - 1) * TILE
+                nvgBeginPath(vg)
+                nvgRect(vg, px + 1, py + 1, TILE - 2, TILE - 2)
+                nvgFillColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 35))
+                nvgFill(vg)
+            end
+        end
     end
 end
 
-function DrawPlayer()
-    local px = player.x
-    local py = player.y
-    local c = GRAVITY_LEVELS[player.gravityLevel].color
+-- ====================================================================
+-- 绘制: 起点/出口
+-- ====================================================================
 
-    -- 身体 (正方形)
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, px, py, PLAYER_W, PLAYER_H)
-    nvgFillColor(nvgCtx, nvgRGBA(C_PLAYER[1], C_PLAYER[2], C_PLAYER[3], 240))
-    nvgFill(nvgCtx)
+function DrawSpawnExit()
+    local TILE = Config.TILE
+    local C = Config.COLORS
 
-    -- 脚底重力光晕
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, px, py + PLAYER_H - 3, PLAYER_W, 3)
-    nvgFillColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 180))
-    nvgFill(nvgCtx)
-
-    -- 眼睛
-    local eyeX = px + PLAYER_W / 2 + player.facing * 3
-    local eyeY = py + PLAYER_H / 2 - 2
-    nvgBeginPath(nvgCtx)
-    nvgCircle(nvgCtx, eyeX, eyeY, 2.5)
-    nvgFillColor(nvgCtx, nvgRGBA(30, 40, 70, 255))
-    nvgFill(nvgCtx)
-end
-
-function DrawEditorCursor()
-    local tx, ty = MouseToTile()
-    if tx < 1 or tx > MAP_W or ty < 1 or ty > MAP_H then return end
-
-    local px = (tx - 1) * TILE - editor.cameraX
-    local py = (ty - 1) * TILE - editor.cameraY
-
-    nvgBeginPath(nvgCtx)
-    nvgRect(nvgCtx, px + 1, py + 1, TILE - 2, TILE - 2)
-    nvgStrokeWidth(nvgCtx, 1.5)
-    nvgStrokeColor(nvgCtx, nvgRGBA(255, 255, 255, 120))
-    nvgStroke(nvgCtx)
-
-    -- 工具预览色
-    if editor.tool == T_SOLID then
-        nvgFillColor(nvgCtx, nvgRGBA(C_PLATFORM[1], C_PLATFORM[2], C_PLATFORM[3], 80))
-    elseif editor.tool >= T_SW1 and editor.tool <= T_SW5 then
-        local c = GRAVITY_LEVELS[editor.tool - 10].color
-        nvgFillColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 50))
-    elseif editor.tool == T_SPAWN then
-        nvgFillColor(nvgCtx, nvgRGBA(0, 255, 150, 50))
-    elseif editor.tool == T_EXIT then
-        nvgFillColor(nvgCtx, nvgRGBA(C_EXIT[1], C_EXIT[2], C_EXIT[3], 50))
+    -- 起点 (三角箭头)
+    local sx = (spawnX - 1) * TILE + TILE / 2
+    local sy = (spawnY - 1) * TILE + TILE / 2
+    nvgBeginPath(vg)
+    nvgMoveTo(vg, sx, sy - 12)
+    nvgLineTo(vg, sx - 9, sy + 6)
+    nvgLineTo(vg, sx + 9, sy + 6)
+    nvgClosePath(vg)
+    nvgFillColor(vg, nvgRGBA(C.SPAWN[1], C.SPAWN[2], C.SPAWN[3], C.SPAWN[4]))
+    nvgFill(vg)
+    if fontId >= 0 then
+        nvgFontFaceId(vg, fontId)
+        nvgFontSize(vg, 8)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_TOP)
+        nvgFillColor(vg, nvgRGBA(C.SPAWN[1], C.SPAWN[2], C.SPAWN[3], 255))
+        nvgText(vg, sx, sy + 8, "START", nil)
     end
-    nvgFill(nvgCtx)
+
+    -- 出口
+    local ex = (exitX - 1) * TILE
+    local ey = (exitY - 1) * TILE
+    nvgBeginPath(vg)
+    nvgRect(vg, ex + 2, ey + 2, TILE - 4, TILE - 4)
+    nvgStrokeWidth(vg, 2)
+    nvgStrokeColor(vg, nvgRGBA(C.EXIT[1], C.EXIT[2], C.EXIT[3], C.EXIT[4]))
+    nvgStroke(vg)
+    nvgFillColor(vg, nvgRGBA(C.EXIT[1], C.EXIT[2], C.EXIT[3], 40))
+    nvgFill(vg)
+    if fontId >= 0 then
+        nvgFontFaceId(vg, fontId)
+        nvgFontSize(vg, 10)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(C.EXIT[1], C.EXIT[2], C.EXIT[3], 255))
+        nvgText(vg, ex + TILE/2, ey + TILE/2, "EXIT", nil)
+    end
 end
 
-function DrawGravityHUD()
-    local g = GRAVITY_LEVELS[player.gravityLevel]
-    local c = g.color
-    local x = 8
-    local y = DESIGN_H - 44
+-- ====================================================================
+-- 绘制: 光标
+-- ====================================================================
+
+function DrawCursor()
+    if not cursorValid then return end
+    local TILE = Config.TILE
+    local px = (cursorTX - 1) * TILE
+    local py = (cursorTY - 1) * TILE
+
+    nvgBeginPath(vg)
+    nvgRect(vg, px + 1, py + 1, TILE - 2, TILE - 2)
+    nvgStrokeWidth(vg, 1.5)
+    nvgStrokeColor(vg, nvgRGBA(255, 255, 255, 150))
+    nvgStroke(vg)
+
+    -- 当前瓦片预览色
+    local tc = Config.GetTileColor(currentTile)
+    if tc[1] then
+        nvgFillColor(vg, nvgRGBA(tc[1], tc[2], tc[3], 40))
+        nvgFill(vg)
+    end
+end
+
+-- ====================================================================
+-- 绘制: 通知
+-- ====================================================================
+
+function DrawNotification()
+    if not notification then return end
+
+    local alpha = math.min(255, math.floor(notifTimer * 255))
+    local nx = Config.DESIGN_W / 2
+    local ny = Config.DESIGN_H - 30
+
+    if fontId >= 0 then
+        -- 背景
+        nvgBeginPath(vg)
+        nvgRoundedRect(vg, nx - 120, ny - 12, 240, 24, 5)
+        nvgFillColor(vg, nvgRGBA(0, 0, 0, math.floor(alpha * 0.7)))
+        nvgFill(vg)
+
+        nvgFontFaceId(vg, fontId)
+        nvgFontSize(vg, 12)
+        nvgTextAlign(vg, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
+        nvgFillColor(vg, nvgRGBA(220, 230, 255, alpha))
+        nvgText(vg, nx, ny, notification, nil)
+    end
+end
+
+-- ====================================================================
+-- 绘制: 验证面板
+-- ====================================================================
+
+function DrawValidationPanel()
+    if not showValidation or not validationResults then return end
+
+    local x = Config.DESIGN_W - 220
+    local y = TOOLBAR_H + 10
+    local w = 210
+    local lineH = 14
+    local results = validationResults.results
+    local h = 30 + #results * lineH
 
     -- 背景
-    nvgBeginPath(nvgCtx)
-    nvgRoundedRect(nvgCtx, x, y, 90, 36, 5)
-    nvgFillColor(nvgCtx, nvgRGBA(0, 0, 0, 180))
-    nvgFill(nvgCtx)
-    nvgStrokeWidth(nvgCtx, 1)
-    nvgStrokeColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 100))
-    nvgStroke(nvgCtx)
+    nvgBeginPath(vg)
+    nvgRoundedRect(vg, x, y, w, h, 6)
+    nvgFillColor(vg, nvgRGBA(10, 15, 30, 230))
+    nvgFill(vg)
+    nvgStrokeWidth(vg, 1)
+    local borderC = validationResults.passed and Config.COLORS.VALID_OK or Config.COLORS.VALID_ERROR
+    nvgStrokeColor(vg, nvgRGBA(borderC[1], borderC[2], borderC[3], 150))
+    nvgStroke(vg)
 
-    if fontId ~= -1 then
-        -- 等级大数字
-        nvgFontFaceId(nvgCtx, fontId)
-        nvgFontSize(nvgCtx, 22)
-        nvgTextAlign(nvgCtx, NVG_ALIGN_CENTER + NVG_ALIGN_MIDDLE)
-        nvgFillColor(nvgCtx, nvgRGBA(c[1], c[2], c[3], 255))
-        nvgText(nvgCtx, x + 20, y + 18, tostring(player.gravityLevel), nil)
+    if fontId >= 0 then
+        nvgFontFaceId(vg, fontId)
+        -- 标题
+        nvgFontSize(vg, 11)
+        nvgTextAlign(vg, NVG_ALIGN_LEFT + NVG_ALIGN_TOP)
+        local titleC = validationResults.passed and Config.COLORS.VALID_OK or Config.COLORS.VALID_ERROR
+        nvgFillColor(vg, nvgRGBA(titleC[1], titleC[2], titleC[3], 255))
+        local title = validationResults.passed and "验证通过" or "验证失败"
+        nvgText(vg, x + 8, y + 6, title .. " (ESC关闭)", nil)
 
-        -- 名称
-        nvgFontSize(nvgCtx, 11)
-        nvgTextAlign(nvgCtx, NVG_ALIGN_LEFT + NVG_ALIGN_MIDDLE)
-        nvgFillColor(nvgCtx, nvgRGBA(200, 210, 230, 220))
-        nvgText(nvgCtx, x + 35, y + 13, g.name, nil)
-
-        -- 跳跃格数
-        nvgFontSize(nvgCtx, 9)
-        nvgFillColor(nvgCtx, nvgRGBA(160, 170, 190, 180))
-        nvgText(nvgCtx, x + 35, y + 26, "跳 " .. g.tiles .. " 格", nil)
+        -- 结果列表
+        nvgFontSize(vg, 9)
+        for i, r in ipairs(results) do
+            local c
+            if r.level == "ok" then c = Config.COLORS.VALID_OK
+            elseif r.level == "warn" then c = Config.COLORS.VALID_WARN
+            elseif r.level == "info" then c = Config.COLORS.TEXT_SECONDARY
+            else c = Config.COLORS.VALID_ERROR end
+            nvgFillColor(vg, nvgRGBA(c[1], c[2], c[3], c[4] or 255))
+            local prefix = r.level == "ok" and "OK " or (r.level == "warn" and "!! " or (r.level == "error" and "XX " or "-- "))
+            nvgText(vg, x + 8, y + 22 + (i - 1) * lineH, prefix .. r.msg, nil)
+        end
     end
 end
