@@ -765,8 +765,10 @@ function HandleNanoVGRender(eventType, eventData)
     DrawGrid()
     -- 绘制地图
     DrawMap()
-    -- 绘制跳跃范围预览 (编辑模式)
-    if not isPlayMode then
+    -- 绘制跳跃范围预览
+    if isPlayMode then
+        DrawJumpPreviewPlay()
+    else
         DrawJumpPreview()
     end
     -- 绘制起点/出口
@@ -995,6 +997,68 @@ end
 -- 绘制: 跳跃范围预览 (选中开关时高亮该重力下可达瓦片)
 -- ====================================================================
 
+-- 试玩模式: 基于玩家当前位置和重力等级显示跳跃范围
+function DrawJumpPreviewPlay()
+    local ps = PlayMode.GetState()
+    if not ps or ps.dead or ps.won then return end
+
+    local TILE = Config.TILE
+    local C = Config.COLORS
+    local JUMP_SPEED = Config.JUMP_SPEED
+    local AIR_SPEED = 150
+
+    local level = ps.gravityLevel
+    local gInfo = Config.GRAVITY_LEVELS[level]
+    local jumpTiles = gInfo.tiles
+    local gravity = gInfo.gravity
+    local gc = C.GRAVITY[level]
+
+    -- 玩家脚底所在瓦片
+    local playerTX = math.floor(ps.x / TILE) + 1
+    local playerTY = math.floor(ps.y / TILE) + 1  -- 脚底瓦片
+
+    -- 向下找最近地面
+    local groundY = nil
+    for y = playerTY, mapH do
+        if Config.IsSolid(map[y][playerTX]) then
+            groundY = y
+            break
+        end
+    end
+    if not groundY then return end
+
+    local standTileY = groundY - 1
+    if standTileY < 1 then return end
+
+    -- 计算水平可达距离
+    local airTime = 2 * JUMP_SPEED / gravity
+    local horizTiles = math.floor(AIR_SPEED * airTime / TILE)
+
+    local topTileY = math.max(1, standTileY - jumpTiles)
+
+    -- 高亮可达瓦片
+    for ty = topTileY, standTileY do
+        local heightAbove = standTileY - ty
+        local vertRatio = heightAbove / jumpTiles
+        local availHoriz = math.floor(horizTiles * math.sqrt(math.max(0, 1 - vertRatio * vertRatio)))
+
+        local rowLeft = math.max(1, playerTX - availHoriz)
+        local rowRight = math.min(mapW, playerTX + availHoriz)
+
+        for tx = rowLeft, rowRight do
+            if not Config.IsSolid(map[ty][tx]) then
+                local px = (tx - 1) * TILE
+                local py = (ty - 1) * TILE
+                nvgBeginPath(vg)
+                nvgRect(vg, px + 1, py + 1, TILE - 2, TILE - 2)
+                nvgFillColor(vg, nvgRGBA(gc[1], gc[2], gc[3], 35))
+                nvgFill(vg)
+            end
+        end
+    end
+end
+
+-- 编辑模式: 基于光标位置和选中开关显示跳跃范围
 function DrawJumpPreview()
     if not cursorValid then return end
     -- 仅当选中开关元素时显示对应重力的跳跃范围
